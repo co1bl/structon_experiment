@@ -1,0 +1,391 @@
+"""
+Structon Routing RL v3 (Loop-Free & Strict)
+===========================================
+核心改进：
+1. Taboo Filtering: 强制禁止传回给已经访问过的节点，彻底消灭 "Ping-Pong" 死循环。
+2. Heavier Penalty: 将错误认领的惩罚从 -1.0 提高到 -2.0，抑制 False Positives。
+3. Fixed Capacity: 修复了 v1 中的变量作用域 bug。
+"""
+
+import numpy as np
+import time
+import gzip
+import os
+import urllib.request
+from typing import List, Tuple, Dict, Any, Optional, Set
+
+# =============================================================================
+# 1. 改进版共振记忆 (Improved LRM) - 保持不变
+# =============================================================================
+class ImprovedResonantMemory:
+    """改进版共振记忆体"""
+    
+    def __init__(
+        self,
+        state_dim: int,
+        n_actions: int,
+        capacity: int = 100,
+        key_dim: Optional[int] = None,
+        temperature: float = 0.1,
+        learning_rate: float = 0.1,
+        decay_rate: float = 0.99,
+        discretize: bool = False,
+    ):
+        self.state_dim = state_dim
+        self.n_actions = n_actions
+        self.capacity = capacity
+        self.temperature = temperature
+        self.learning_rate = learning_rate
+        self.decay_rate = decay_rate
+        self.discretize = discretize
+        
+        # 投影矩阵：将高维特征映射到 Key 空间
+        self.key_dim = key_dim or 64
+        self.projector = np.random.randn(state_dim, self.key_dim).astype(np.float32)
+        self.projector /= np.linalg.norm(self.projector, axis=0, keepdims=True) + 1e-8
+        
+        self.keys: List[np.ndarray] = []
+        self.values: List[np.ndarray] = []
+        self.access_counts: List[int] = []
+    
+    def _encode(self, state: np.ndarray) -> np.ndarray:
+        key = state.astype(np.float32) @ self.projector
+        norm = np.linalg.norm(key)
+        if norm > 1e-8:
+            key /= norm
+        return key
+    
+    def query(self, state: np.ndarray) -> Tuple[np.ndarray, float]:
+        if len(self.keys) == 0:
+            return np.zeros(self.n_actions, dtype=np.float32), 0.0
+        
+        query_key = self._encode(state)
+        key_bank = np.array(self.keys)
+        
+        scores = key_bank @ query_key
+        max_score = np.max(scores)
+        
+        weights = np.exp((scores - max_score) / self.temperature)
+        weights /= np.sum(weights) + 1e-8
+        
+        value_bank = np.array(self.values)
+        q_values = weights @ value_bank
+        
+        top_idx = int(np.argmax(weights))
+        self.access_counts[top_idx] += 1
+        
+        return q_values, float(max_score)
+    
+    def remember(self, state: np.ndarray, action: int, target_q: float) -> None:
+        query_key = self._encode(state)
+        
+        # 1. Update Existing
+        if len(self.keys) > 0:
+            key_bank = np.array(self.keys)
+            scores = key_bank @ query_key
+            best_idx = int(np.argmax(scores))
+            best_score = float(scores[best_idx])
+            
+            if best_score > 0.90:
+                old_val = self.values[best_idx][action]
+                self.values[best_idx][action] = old_val + self.learning_rate * (target_q - old_val)
+                self.access_counts[best_idx] += 1
+                return
+
+        # 2. Add New
+        if len(self.keys) > 0:
+            new_q, _ = self.query(state)
+            new_q = new_q.copy()
+        else:
+            new_q = np.zeros(self.n_actions, dtype=np.float32)
+            
+        new_q[action] = target_q
+        
+        # Capacity Management
+        if len(self.keys) >= self.capacity:
+            forgotten_idx = int(np.argmin(self.access_counts))
+            self.keys.pop(forgotten_idx)
+            self.values.pop(forgotten_idx)
+            self.access_counts.pop(forgotten_idx)
+        
+        self.keys.append(query_key)
+        self.values.append(new_q)
+        self.access_counts.append(1)
+
+# =============================================================================
+# 2. 特征提取 (State Extractor) - 保持不变
+# =============================================================================
+class StateExtractor:
+    def __init__(self, grid_size=7):
+        self.grid_size = grid_size
+        
+    def extract(self, image: np.ndarray) -> np.ndarray:
+        img = image.astype(np.float32) / 255.0
+        h, w = img.shape
+        bh, bw = h // self.grid_size, w // self.grid_size
+        features = []
+        
+        grid = np.zeros((self.grid_size, self.grid_size))
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                grid[i, j] = np.mean(img[i*bh:(i+1)*bh, j*bw:(j+1)*bw])
+        
+        mean_val = np.mean(grid)
+        for val in grid.flat:
+            features.append(1.0 if val > mean_val else -1.0)
+            
+        features.extend((grid[:, :-1] - grid[:, 1:]).flatten())
+        features.extend((grid[:-1, :] - grid[1:, :]).flatten())
+        
+        features.append(np.mean(grid[:3, :3]) - np.mean(grid[4:, 4:]))
+        features.append(np.mean(grid[:3, 4:]) - np.mean(grid[4:, :3]))
+        
+        state = np.array(features, dtype=np.float32)
+        norm = np.linalg.norm(state)
+        return state / (norm + 1e-6)
+
+# =============================================================================
+# 3. 智能路由 Structon v3 (支持 Taboo Filtering)
+# =============================================================================
+class RoutingStructon:
+    def __init__(self, label: str, capacity=300):
+        self.label = label
+        self.neighbors: List['RoutingStructon'] = []
+        self.memory: Optional[ImprovedResonantMemory] = None
+        self.capacity = capacity
+        
+    def connect(self, all_structons, n_connections=3):
+        others = [s for s in all_structons if s.label != self.label]
+        
+        if len(others) >= n_connections:
+            self.neighbors = list(np.random.choice(others, n_connections, replace=False))
+        else:
+            self.neighbors = others
+            
+        n_actions = 1 + len(self.neighbors)
+        
+        self.memory = ImprovedResonantMemory(
+            state_dim=135,
+            n_actions=n_actions,
+            capacity=self.capacity,
+            key_dim=64,
+            temperature=0.08
+        )
+        
+    def decide(self, state: np.ndarray, visited_labels: Set[str], epsilon: float = 0.1) -> int:
+        """
+        带禁忌过滤的决策：
+        不能选择会导致跳回 visited_labels 的动作。
+        """
+        q, _ = self.memory.query(state)
+        
+        # --- Taboo Filtering ---
+        # 动作 0 (Claim) 总是允许的
+        valid_actions = [0]
+        
+        # 检查每个邻居动作
+        for i, neighbor in enumerate(self.neighbors):
+            action_idx = i + 1
+            if neighbor.label not in visited_labels:
+                valid_actions.append(action_idx)
+        
+        # 极端情况：如果被围死了，只能 Claim
+        if not valid_actions:
+            valid_actions = [0]
+
+        # --- Epsilon-Greedy on Valid Actions ---
+        if np.random.random() < epsilon:
+            return np.random.choice(valid_actions)
+        else:
+            # Mask invalid actions with -inf
+            masked_q = np.full_like(q, -np.inf)
+            masked_q[valid_actions] = q[valid_actions]
+            return int(np.argmax(masked_q))
+
+# =============================================================================
+# 4. 视觉系统 v3 (更严厉的惩罚机制)
+# =============================================================================
+class StructonRoutingSystem:
+    def __init__(self, capacity=200, n_connections=3):
+        self.extractor = StateExtractor()
+        self.structons: List[RoutingStructon] = []
+        self.n_connections = n_connections
+        self.capacity = capacity
+        
+    def build(self, labels):
+        self.structons = [RoutingStructon(l, self.capacity) for l in labels]
+        for s in self.structons:
+            s.connect(self.structons, self.n_connections)
+        print(f"Build complete: {len(self.structons)} structons, {self.n_connections} neighbors each.")
+
+    def train_episode(self, image: np.ndarray, true_label: str, epsilon: float = 0.1):
+        state = self.extractor.extract(image)
+        # 随机入口
+        current = self.structons[np.random.randint(len(self.structons))]
+        
+        trajectory = [] 
+        visited = set() # 记录已访问的节点
+        
+        max_hops = 10
+        done = False
+        final_result = "timeout"
+        
+        for _ in range(max_hops):
+            visited.add(current.label)
+            
+            # 传入 visited 集合
+            action = current.decide(state, visited, epsilon)
+            trajectory.append((current, action))
+            
+            if action == 0: # Claim
+                if current.label == true_label:
+                    final_result = "correct"
+                else:
+                    final_result = "wrong"
+                done = True
+                break
+            else: # Route
+                neighbor_idx = action - 1
+                if neighbor_idx < len(current.neighbors):
+                    current = current.neighbors[neighbor_idx]
+                else:
+                    break # Should not happen with valid_actions logic
+        
+        # --- 奖励调整 (Heavier Penalty) ---
+        if final_result == "correct":
+            final_reward = 1.0
+        elif final_result == "wrong":
+            final_reward = -2.0  # <--- [改进] 从 -1.0 提高到 -2.0，严惩乱猜
+        else: # timeout
+            final_reward = -0.5
+            
+        # --- 反向传播 ---
+        running_reward = final_reward
+        gamma = 0.9 
+        step_penalty = -0.05 
+        
+        for structon, action in reversed(trajectory):
+            structon.memory.remember(state, action, running_reward)
+            running_reward = running_reward * gamma + step_penalty
+
+        return final_result
+
+    def predict(self, image: np.ndarray) -> Tuple[str, List[str]]:
+        state = self.extractor.extract(image)
+        current = self.structons[np.random.randint(len(self.structons))]
+        path = []
+        visited = set()
+        
+        # 预测时也必须应用 Taboo 逻辑，否则会死循环
+        for _ in range(15):
+            path.append(current.label)
+            visited.add(current.label)
+            
+            # 预测时 epsilon=0 (纯贪婪)
+            action = current.decide(state, visited, epsilon=0.0)
+            
+            if action == 0:
+                return current.label, path
+            else:
+                neighbor_idx = action - 1
+                if neighbor_idx < len(current.neighbors):
+                    current = current.neighbors[neighbor_idx]
+                else:
+                    break
+                
+        return "unknown", path
+
+# =============================================================================
+# 5. 主程序 (Main)
+# =============================================================================
+def load_mnist():
+    base_url = 'https://storage.googleapis.com/cvdf-datasets/mnist/'
+    files = {
+        'train_images': 'train-images-idx3-ubyte.gz',
+        'train_labels': 'train-labels-idx1-ubyte.gz',
+        'test_images': 't10k-images-idx3-ubyte.gz',
+        'test_labels': 't10k-labels-idx1-ubyte.gz'
+    }
+    data = {}
+    mnist_dir = os.path.expanduser('~/.mnist')
+    os.makedirs(mnist_dir, exist_ok=True)
+    
+    for key, filename in files.items():
+        filepath = os.path.join(mnist_dir, filename)
+        if not os.path.exists(filepath):
+            print(f"Downloading {filename}...")
+            urllib.request.urlretrieve(base_url + filename, filepath)
+        with gzip.open(filepath, 'rb') as f:
+            if 'images' in key:
+                f.read(16)
+                data[key] = np.frombuffer(f.read(), dtype=np.uint8).reshape(-1, 28, 28)
+            else:
+                f.read(8)
+                data[key] = np.frombuffer(f.read(), dtype=np.uint8)
+    return data['train_images'], data['train_labels'], data['test_images'], data['test_labels']
+
+def main():
+    print("=" * 60)
+    print("Structon RL Routing v3 (Loop-Free + Strict)")
+    print("动作 0: Claim | 动作 1-N: Route | Feature: Taboo Search")
+    print("=" * 60)
+    
+    # 1. 加载数据
+    train_img, train_lbl, test_img, test_lbl = load_mnist()
+    
+    # 2. 构建系统
+    system = StructonRoutingSystem(capacity=300, n_connections=3)
+    system.build([str(i) for i in range(10)])
+    
+    # 3. 训练
+    n_epochs = 5
+    batch_size = 2000 
+    
+    print(f"\n开始训练 ({n_epochs} 轮)...")
+    t0 = time.time()
+    
+    for ep in range(n_epochs):
+        indices = np.random.choice(len(train_img), batch_size, replace=False)
+        outcomes = {'correct': 0, 'wrong': 0, 'timeout': 0}
+        
+        epsilon = max(0.05, 0.5 * (0.6 ** ep))
+        
+        for i in indices:
+            res = system.train_episode(train_img[i], str(train_lbl[i]), epsilon)
+            outcomes[res] += 1
+            
+        acc = outcomes['correct'] / batch_size * 100
+        print(f"Epoch {ep+1}: Acc={acc:.1f}% (Correct: {outcomes['correct']}, Wrong: {outcomes['wrong']}, Timeout: {outcomes['timeout']}) | Eps={epsilon:.2f}")
+    
+    print(f"训练耗时: {time.time()-t0:.1f}s")
+    
+    # 4. 测试
+    print("\n=== 测试集评估 ===")
+    test_size = 500
+    test_indices = np.random.choice(len(test_img), test_size, replace=False)
+    correct = 0
+    
+    print(f"示例路径 (Check for loops):")
+    for i, idx in enumerate(test_indices):
+        pred, path = system.predict(test_img[idx])
+        true_lbl = str(test_lbl[idx])
+        if pred == true_lbl:
+            correct += 1
+            
+        if i < 15: 
+            status = "✓" if pred == true_lbl else "✗"
+            path_str = " -> ".join(path)
+            print(f"  True: {true_lbl} | Pred: {pred} {status} | Path: {path_str}")
+            
+    print(f"\n最终准确率: {correct/test_size*100:.1f}%")
+    
+    # 5. 记忆统计
+    print("\n记忆体统计:")
+    total_mem = 0
+    for s in system.structons:
+        mem_size = len(s.memory.keys)
+        total_mem += mem_size
+    print(f"Total Memories: {total_mem}")
+
+if __name__ == "__main__":
+    main()
