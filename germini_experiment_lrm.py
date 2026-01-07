@@ -1,15 +1,11 @@
 """
-Structon Routing RL: 基于改进版共振记忆的学习型路由网络
-====================================================
+Structon Routing RL (Fixed Version)
+===================================
+动作 0: Claim (Yes)
+动作 1-N: Route to Neighbor
 
-核心思想：
-1. 每个 Structon 是一个独立的 Agent。
-2. 动作空间：Action 0 = Claim (这是我的数字); Action 1..k = Route (传给邻居 k)。
-3. 训练方式：多步轨迹回溯更新 (Trajectory Replay)。
-
-结合了：
-- improved_local_resonant_memory.py 的记忆机制
-- structon_mnist_v9_6.py 的特征提取
+修复内容：
+- 解决了 'capacity' is not defined 的变量作用域错误。
 """
 
 import numpy as np
@@ -18,13 +14,12 @@ import gzip
 import os
 import urllib.request
 from typing import List, Tuple, Dict, Any, Optional
-import argparse
 
 # =============================================================================
-# 1. 改进版共振记忆 (移植自 file 1)
+# 1. 改进版共振记忆 (Improved LRM)
 # =============================================================================
 class ImprovedResonantMemory:
-    """改进版共振记忆体 - 移植并适配"""
+    """改进版共振记忆体"""
     
     def __init__(
         self,
@@ -33,9 +28,9 @@ class ImprovedResonantMemory:
         capacity: int = 100,
         key_dim: Optional[int] = None,
         temperature: float = 0.1,
-        learning_rate: float = 0.1, # 降低一点 LR 以稳定路由
-        decay_rate: float = 0.99,   # 记忆访问衰减
-        discretize: bool = False,   # 图像特征建议不用离散化，使用投影
+        learning_rate: float = 0.1,
+        decay_rate: float = 0.99,
+        discretize: bool = False,
     ):
         self.state_dim = state_dim
         self.n_actions = n_actions
@@ -79,7 +74,7 @@ class ImprovedResonantMemory:
         value_bank = np.array(self.values)
         q_values = weights @ value_bank
         
-        # 访问计数增加 (选取权重最大的)
+        # 访问计数增加
         top_idx = int(np.argmax(weights))
         self.access_counts[top_idx] += 1
         
@@ -91,7 +86,6 @@ class ImprovedResonantMemory:
         
         # 衰减访问计数
         if self.decay_rate < 1.0 and len(self.access_counts) > 0:
-             # 简单的定期衰减，实际实现可简化
              pass 
 
         # 1. 尝试更新现有记忆
@@ -109,15 +103,14 @@ class ImprovedResonantMemory:
 
         # 2. 新增记忆
         if len(self.keys) > 0:
-            # 继承附近的 Q 值作为初始值，加速收敛
             new_q, _ = self.query(state)
             new_q = new_q.copy()
         else:
             new_q = np.zeros(self.n_actions, dtype=np.float32)
             
-        new_q[action] = target_q # 初始赋予目标值
+        new_q[action] = target_q
         
-        # 容量管理：移除最少使用的
+        # 容量管理
         if len(self.keys) >= self.capacity:
             forgotten_idx = int(np.argmin(self.access_counts))
             self.keys.pop(forgotten_idx)
@@ -129,7 +122,7 @@ class ImprovedResonantMemory:
         self.access_counts.append(1)
 
 # =============================================================================
-# 2. 特征提取 (保持 Structon v9.6 的优秀特征)
+# 2. 特征提取 (State Extractor)
 # =============================================================================
 class StateExtractor:
     """Contrast Binary + Structure 特征提取"""
@@ -142,44 +135,42 @@ class StateExtractor:
         bh, bw = h // self.grid_size, w // self.grid_size
         features = []
         
-        # 简化版实现，保留核心特征
         grid = np.zeros((self.grid_size, self.grid_size))
         for i in range(self.grid_size):
             for j in range(self.grid_size):
                 grid[i, j] = np.mean(img[i*bh:(i+1)*bh, j*bw:(j+1)*bw])
         
-        # 1. Contrast (49)
+        # 1. Contrast
         mean_val = np.mean(grid)
         for val in grid.flat:
             features.append(1.0 if val > mean_val else -1.0)
             
-        # 2. Gradients (84)
-        # Horizontal
+        # 2. Gradients
         features.extend((grid[:, :-1] - grid[:, 1:]).flatten())
-        # Vertical
         features.extend((grid[:-1, :] - grid[1:, :]).flatten())
         
         # 3. Global Stats
-        features.append(np.mean(grid[:3, :3]) - np.mean(grid[4:, 4:])) # TL - BR
-        features.append(np.mean(grid[:3, 4:]) - np.mean(grid[4:, :3])) # TR - BL
+        features.append(np.mean(grid[:3, :3]) - np.mean(grid[4:, 4:]))
+        features.append(np.mean(grid[:3, 4:]) - np.mean(grid[4:, :3]))
         
         state = np.array(features, dtype=np.float32)
         norm = np.linalg.norm(state)
         return state / (norm + 1e-6)
 
 # =============================================================================
-# 3. 智能路由 Structon
+# 3. 智能路由 Structon (修复了 capacity 问题)
 # =============================================================================
 class RoutingStructon:
     def __init__(self, label: str, capacity=300):
         self.label = label
         self.neighbors: List['RoutingStructon'] = []
         self.memory: Optional[ImprovedResonantMemory] = None
+        self.capacity = capacity  # <--- [修复] 保存 capacity
         
     def connect(self, all_structons, n_connections=3):
         """建立连接并初始化记忆体"""
         others = [s for s in all_structons if s.label != self.label]
-        # 随机选择邻居 (模拟局部连接)
+        
         if len(others) >= n_connections:
             self.neighbors = list(np.random.choice(others, n_connections, replace=False))
         else:
@@ -190,9 +181,9 @@ class RoutingStructon:
         
         # 初始化记忆体
         self.memory = ImprovedResonantMemory(
-            state_dim=135, # 约 135 维特征
+            state_dim=135,
             n_actions=n_actions,
-            capacity=capacity,
+            capacity=self.capacity,  # <--- [修复] 使用 self.capacity
             key_dim=64,
             temperature=0.08
         )
@@ -248,36 +239,32 @@ class StructonRoutingSystem:
             else: # Route (No)
                 # Action i -> Neighbor i-1
                 neighbor_idx = action - 1
-                current = current.neighbors[neighbor_idx]
+                if neighbor_idx < len(current.neighbors):
+                    current = current.neighbors[neighbor_idx]
+                else:
+                    break # Should not happen
         
         # --- 2. 计算奖励 (Reward Calculation) ---
         if final_result == "correct":
             final_reward = 1.0
         elif final_result == "wrong":
-            final_reward = -1.0 # 惩罚抢答错误
+            final_reward = -1.0
         else: # timeout
-            final_reward = -0.5 # 惩罚找不到路
+            final_reward = -0.5
             
         # --- 3. 反向传播更新 (Backward Update) ---
-        # 我们使用蒙特卡洛回报：G_t = r + gamma * G_{t+1}
         running_reward = final_reward
-        gamma = 0.9 # 衰减系数，让之前的节点分到的奖励少一点（鼓励短路径）
-        step_penalty = -0.05 # 每多跳一步扣一点分，鼓励快速找到
+        gamma = 0.9 
+        step_penalty = -0.05 
         
         for structon, action in reversed(trajectory):
-            # Q-Learning update: target = reward
-            # 这里的 reward 是该步骤之后累积的折扣回报
             structon.memory.remember(state, action, running_reward)
-            
-            # 衰减并加上单步惩罚
             running_reward = running_reward * gamma + step_penalty
 
         return final_result
 
     def predict(self, image: np.ndarray) -> Tuple[str, List[str]]:
         state = self.extractor.extract(image)
-        # 测试时通常从固定的或者随机的入口进入
-        # 为了稳定性，可以多次随机入口投票，或者简单地随机选一个
         current = self.structons[np.random.randint(len(self.structons))]
         path = []
         
@@ -290,7 +277,10 @@ class StructonRoutingSystem:
                 return current.label, path
             else:
                 neighbor_idx = action - 1
-                current = current.neighbors[neighbor_idx]
+                if neighbor_idx < len(current.neighbors):
+                    current = current.neighbors[neighbor_idx]
+                else:
+                    break
                 
         return "unknown", path
 
@@ -325,7 +315,7 @@ def load_mnist():
 
 def main():
     print("=" * 60)
-    print("Structon RL Routing Experiment")
+    print("Structon RL Routing Experiment (Fixed)")
     print("动作 0: Claim (Yes) | 动作 1-N: Route to Neighbor")
     print("=" * 60)
     
@@ -333,13 +323,12 @@ def main():
     train_img, train_lbl, test_img, test_lbl = load_mnist()
     
     # 2. 构建系统
-    # 减少 connections 强制它学习跳跃，增加 connections 路由更容易但表更大
     system = StructonRoutingSystem(capacity=300, n_connections=3)
     system.build([str(i) for i in range(10)])
     
     # 3. 训练
     n_epochs = 5
-    batch_size = 2000 # 每个 epoch 随机采样的样本数
+    batch_size = 2000 
     
     print(f"\n开始训练 ({n_epochs} 轮)...")
     t0 = time.time()
@@ -348,7 +337,6 @@ def main():
         indices = np.random.choice(len(train_img), batch_size, replace=False)
         outcomes = {'correct': 0, 'wrong': 0, 'timeout': 0}
         
-        # 随时间降低探索率 epsilon
         epsilon = max(0.05, 0.5 * (0.6 ** ep))
         
         for i in indices:
@@ -373,7 +361,7 @@ def main():
         if pred == true_lbl:
             correct += 1
             
-        if i < 10: # 打印前10个示例
+        if i < 10: 
             status = "✓" if pred == true_lbl else "✗"
             path_str = " -> ".join(path)
             print(f"  True: {true_lbl} | Pred: {pred} {status} | Path: {path_str}")
