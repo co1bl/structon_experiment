@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""
+Structon Vision v10.3 - 动力学梯度 + 143维特征
+1. 特征：继承 v9.6 的 Contrast Binary + Structure (143维)
+2. 动力学：重复惩罚 (Anti-Cycle) + 动能耗散 (Momentum Dissipation)
+3. 学习：局部强化 (Local Reinforcement)
+"""
+
+import numpy as np
+import time
+import gzip
+import os
+import urllib.request
+from typing import List, Tuple, Dict
+
+# =============================================================================
+# 1. MNIST 加载
+# =============================================================================
+def load_mnist():
+    base_url = 'https://storage.googleapis.com/cvdf-datasets/mnist/'
+    files = {
+        'train_images': 'train-images-idx3-ubyte.gz', 'train_labels': 'train-labels-idx1-ubyte.gz',
+        'test_images': 't10k-images-idx3-ubyte.gz', 'test_labels': 't10k-labels-idx1-ubyte.gz'
+    }
+    data = {}
+    mnist_dir = os.path.expanduser('~/.mnist')
+    os.makedirs(mnist_dir, exist_ok=True)
+    for key, filename in files.items():
+        filepath = os.path.join(mnist_dir, filename)
+        if not os.path.exists(filepath):
+            urllib.request.urlretrieve(base_url + filename, filepath)
+        with gzip.open(filepath, 'rb') as f:
+            if 'images' in key:
+                f.read(16); data[key] = np.frombuffer(f.read(), dtype=np.uint8).reshape(-1, 28, 28)
+            else:
+                f.read(8); data[key] = np.frombuffer(f.read(), dtype=np.uint8)
+    return data['train_images'], data['train_labels'], data['test_images'], data['test_labels']
+
+# =============================================================================
+# 2. 特征提取 (继承 v9.6 最佳方案)
+# =============================================================================
+class StateExtractor:
+    def __init__(self, grid_size=7, threshold=0.25):
+        self.grid_size = grid_size
+        self.threshold = threshold
+        
+    def extract(self, image: np.ndarray) -> np.ndarray:
+        img = image.astype(np.float32) / 255.0
+        h, w = img.shape
+        bh, bw = h // self.grid_size, w // self.grid_size
+        features = []
+        grid = np.zeros((self.grid_size, self.grid_size))
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                grid[i, j] = np.mean(img[i*bh:(i+1)*bh, j*bw:(j+1)*bw])
+        
+        # 1. Contrast Binary
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                features.append(-1.0 if grid[i, j] < self.threshold else 1.0)
+        # 2. 水平/垂直差异
+        for i in range(self.grid_size):
+            for j in range(self.grid_size - 1): features.append((grid[i, j] - grid[i, j+1]) * 2)
+        for i in range(self.grid_size - 1):
+            for j in range(self.grid_size): features.append((grid[i, j] - grid[i+1, j]) * 2)
+        # 3. 对角线 & 四象限
+        diag1 = np.mean([grid[i, i] for i in range(self.grid_size)])
+        diag2 = np.mean([grid[i, self.grid_size-1-i] for i in range(self.grid_size)])
+        features.extend([(diag1 - 0.5) * 2, (diag2 - 0.5) * 2, (diag1 - diag2) * 2])
+        mid = self.grid_size // 2
+        q1, q2 = np.mean(grid[:mid, :mid]), np.mean(grid[:mid, mid:])
+        q3, q4 = np.mean(grid[mid:, :mid]), np.mean(grid[mid:, mid:])
+        features.extend([(q1 - q4) * 2, (q2 - q3) * 2, (q1 + q4 - q2 - q3) * 2, ((q1 + q2) - (q3 + q4)) * 2])
+        # 4. 边缘
+        features.extend([(np.mean(grid[0, :]) - np.mean(grid[-1, :])) * 2, (np.mean(grid[:, 0]) - np.mean(grid[:, -1])) * 2])
+        
+        state = np.array(features, dtype=np.float32)
+        norm = np.linalg.norm(state)
+        return state / norm if norm > 1e-6 else state
+
+# =============================================================================
+# 3. 动力学 LRM
+# =============================================================================
+class KineticLRM:
+    def __init__(self, n_actions=4, capacity=400):
+        self.n_actions = n_actions
+        self.capacity = capacity
+        self.keys, self.values, self.access = [], [], []
+        self.lr = 0.5
+        self.sim_threshold = 0.85
+
+    def query(self, state):
+        if not self.keys: return np.zeros(self.n_actions)
+        scores = np.dot(np.array(self.keys), state)
+        best_idx = np.argmax(scores)
+        if scores[best_idx] > 0.1: return self.values[best_idx] * scores[best_idx]
+        return np.zeros(self.n_actions)
+
+    def update(self, state, action, reward):
+        if self.keys:
+            scores = np.dot(np.array(self.keys), state)
+            best_idx = np.argmax(scores)
+            if scores[best_idx] > self.sim_threshold:
+                self.values[best_idx][action] += self.lr * (reward - self.values[best_idx][action])
+                self.access[best_idx] += 1
+                return
+        val = np.zeros(self.n_actions, dtype=np.float32); val[action] = reward
+        if len(self.keys) >= self.capacity:
+            idx = np.argmin(self.access); self.keys.pop(idx); self.values.pop(idx); self.access.pop(idx)
+        self.keys.append(state.copy()); self.values.append(val); self.access.append(1)
+
+# =============================================================================
+# 4. 视觉系统 - 惩罚机制实现
+# =============================================================================
+class Structon:
+    def __init__(self, label):
+        self.label, self.connections, self.lrm = label, [], KineticLRM()
+
+class KineticVisionSystem:
+    def __init__(self):
+        self.extractor = StateExtractor()
+        self.structons = [Structon(str(i)) for i in range(10)]
+        for s in self.structons:
+            others = [o for o in self.structons if o != s]
+            s.connections = list(np.random.choice(others, 3, replace=False))
+
+    def navigate(self, image, target_label=None, train=False):
+        state = self.extractor.extract(image)
+        current = np.random.choice(self.structons)
+        momentum = 1.3
+        path, visited = [], {}
+        
+        while momentum > 0.1:
+            label = current.label
+            path.append(label)
+            
+            # --- 核心讨论点：重复即惩罚 (Anti-Cycle) ---
+            if label in visited:
+                # 每重复回到该节点一次，动能惩罚力度加大
+                penalty = 0.25 * visited[label]
+                momentum -= penalty
+            visited[label] = visited.get(label, 0) + 1
+            
+            q_vec = current.lrm.query(state)
+            action = np.argmax(q_vec)
+            conf = q_vec[action]
+            
+            if action == 0: # 认领尝试
+                if train and target_label:
+                    if label == target_label:
+                        current.lrm.update(state, 0, 10.0) # 强吸引子奖励
+                        return label, path
+                    else:
+                        current.lrm.update(state, 0, -8.0) # 强排斥子惩罚
+                        momentum -= 0.5
+                elif conf > 0.6: # 推理满足感阈值
+                    return label, path
+                else:
+                    momentum -= 0.15
+            
+            # 路由尝试：永远给小奖，维持流动本能
+            if train:
+                route_act = action if action > 0 else np.random.randint(1, 4)
+                current.lrm.update(state, route_act, 0.4)
+            
+            # 执行跳转
+            next_idx = (action - 1) if action > 0 else np.random.randint(0, 3)
+            current = current.connections[next_idx]
+            momentum -= 0.05 # 基础物理摩擦
+            
+        return current.label, path
+
+# =============================================================================
+# 5. 执行实验
+# =============================================================================
+if __name__ == "__main__":
+    sys = KineticVisionSystem()
+    train_img, train_lbl, test_img, test_lbl = load_mnist()
+    print("Structon v10.3: 143维特征 + 重复惩罚机制...")
+    
+    for ep in range(10):
+        t0 = time.time()
+        idxs = np.random.choice(len(train_img), 1200)
+        for idx in idxs: sys.navigate(train_img[idx], str(train_lbl[idx]), train=True)
+            
+        correct = 0
+        for i in range(200):
+            if sys.navigate(test_img[i])[0] == str(test_lbl[i]): correct += 1
+        print(f"Epoch {ep+1:2d} | 满足率: {correct/200*100:4.1f}% | 耗时: {time.time()-t0:2.1f}s")
+
+    res, p = sys.navigate(test_img[0])
+    print(f"\n真:{test_lbl[0]} 预:{res} | 路径: {' -> '.join(p)}")
