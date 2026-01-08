@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+import numpy as np
+import time
+import gzip
+import os
+import urllib.request
+from typing import List, Tuple
+
+# =============================================================================
+# 1. 基础工具 (保持特征提取不变)
+# =============================================================================
+def load_mnist():
+    base_url = 'https://storage.googleapis.com/cvdf-datasets/mnist/'
+    files = {
+        'train_images': 'train-images-idx3-ubyte.gz', 'train_labels': 'train-labels-idx1-ubyte.gz',
+        'test_images': 't10k-images-idx3-ubyte.gz', 'test_labels': 't10k-labels-idx1-ubyte.gz'
+    }
+    data = {}
+    mnist_dir = os.path.expanduser('~/.mnist')
+    os.makedirs(mnist_dir, exist_ok=True)
+    for key, filename in files.items():
+        filepath = os.path.join(mnist_dir, filename)
+        if not os.path.exists(filepath):
+            urllib.request.urlretrieve(base_url + filename, filepath)
+        with gzip.open(filepath, 'rb') as f:
+            if 'images' in key:
+                f.read(16); data[key] = np.frombuffer(f.read(), dtype=np.uint8).reshape(-1, 28, 28)
+            else:
+                f.read(8); data[key] = np.frombuffer(f.read(), dtype=np.uint8)
+    return data['train_images'], data['train_labels'], data['test_images'], data['test_labels']
+
+class StateExtractor:
+    def __init__(self, grid_size=7, threshold=0.25):
+        self.grid_size = grid_size
+        self.threshold = threshold
+        
+    def extract(self, image: np.ndarray) -> np.ndarray:
+        img = image.astype(np.float32) / 255.0
+        grid = np.zeros((self.grid_size, self.grid_size))
+        bh, bw = img.shape[0] // self.grid_size, img.shape[1] // self.grid_size
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                grid[i, j] = np.mean(img[i*bh:(i+1)*bh, j*bw:(j+1)*bw])
+        features = [-1.0 if v < self.threshold else 1.0 for v in grid.flatten()]
+        features.append((np.mean(grid[:3, :]) - np.mean(grid[4:, :])) * 2) 
+        features.append((np.mean(grid[:, :3]) - np.mean(grid[:, 4:])) * 2)
+        state = np.array(features, dtype=np.float32)
+        norm = np.linalg.norm(state)
+        return state / norm if norm > 1e-6 else state
+
+# =============================================================================
+# 2. 局部 LRM (强化对比度)
+# =============================================================================
+class KineticLRM:
+    def __init__(self, n_actions=4):
+        self.n_actions = n_actions
+        self.keys = []
+        self.values = []
+        self.lr = 0.5 # 提升学习率
+        self.sim_threshold = 0.88
+
+    def query(self, state):
+        if not self.keys: return np.zeros(self.n_actions)
+        scores = np.dot(np.array(self.keys), state)
+        best_idx = np.argmax(scores)
+        if scores[best_idx] > 0.1:
+            return self.values[best_idx] * scores[best_idx]
+        return np.zeros(self.n_actions)
+
+    def update(self, state, action_idx, reward):
+        if self.keys:
+            scores = np.dot(np.array(self.keys), state)
+            best_idx = np.argmax(scores)
+            if scores[best_idx] > self.sim_threshold:
+                self.values[best_idx][action_idx] += self.lr * (reward - self.values[best_idx][action_idx])
+                return
+        val = np.zeros(self.n_actions, dtype=np.float32)
+        val[action_idx] = reward
+        if len(self.keys) >= 400:
+            self.keys.pop(0); self.values.pop(0)
+        self.keys.append(state.copy()); self.values.append(val)
+
+# =============================================================================
+# 3. 结构体与系统 (引入 Tabu 惩罚与动能硬耗散)
+# =============================================================================
+class Structon:
+    def __init__(self, label):
+        self.label = label
+        self.connections = []
+        self.lrm = None
+
+    def link(self, others):
+        self.connections = list(np.random.choice(others, 3, replace=False))
+        self.lrm = KineticLRM(n_actions=4)
+
+class DynamicVisionSystem:
+    def __init__(self):
+        self.extractor = StateExtractor()
+        self.structons = [Structon(str(i)) for i in range(10)]
+        for s in self.structons:
+            others = [o for o in self.structons if o != s]
+            s.link(others)
+
+    def navigate(self, image, target_label=None, train=False):
+        state = self.extractor.extract(image)
+        current = np.random.choice(self.structons)
+        momentum = 1.0
+        path_history = []
+        visited = [] # 用于检测循环
+
+        while momentum > 0.1:
+            q_vec = current.lrm.query(state)
+            action = np.argmax(q_vec)
+            conf = q_vec[action]
+            path_history.append(current.label)
+            
+            # --- 检测震荡与循环 ---
+            if current.label in visited:
+                momentum -= 0.2 # 发现循环，大幅扣除动能，强制逃逸或终止
+            visited.append(current.label)
+            if len(visited) > 4: visited.pop(0) # 保持短时记忆
+
+            if action == 0: # 尝试认领
+                if train and target_label:
+                    if current.label == target_label:
+                        current.lrm.update(state, 0, 5.0) # [对] 极深吸引子
+                        return current.label, path_history
+                    else:
+                        current.lrm.update(state, 0, -4.0) # [错] 极高排斥子
+                        momentum -= 0.4
+                elif conf > 0.8: # 推理时：只要够稳定就满足
+                    return current.label, path_history
+                else:
+                    momentum -= 0.15
+            
+            # --- 路由动作 ---
+            if train:
+                # 路由奖励调低(0.2)，不再能抵消摩擦力(0.08)
+                route_act = action if action > 0 else np.random.randint(1, 4)
+                current.lrm.update(state, route_act, 0.2) 
+            
+            # 执行跳转
+            next_idx = (action - 1) if action > 0 else np.random.randint(0, 3)
+            current = current.connections[next_idx]
+            
+            # 动能硬耗散：不再受 conf 补充，模拟物理摩擦
+            momentum -= 0.08 
+            
+        return current.label, path_history
+
+if __name__ == "__main__":
+    print("Structon v10.1: 抑制震荡版 (Anti-Oscillation Edition)")
+    sys = DynamicVisionSystem()
+    train_img, train_lbl, test_img, test_lbl = load_mnist()
+    
+    for ep in range(10):
+        # 增加单次训练样本量
+        idxs = np.random.choice(len(train_img), 1200)
+        for idx in idxs:
+            sys.navigate(train_img[idx], str(train_lbl[idx]), train=True)
+            
+        correct = 0
+        for i in range(200):
+            if sys.navigate(test_img[i])[0] == str(test_lbl[i]): correct += 1
+        print(f"Epoch {ep+1:2d} | 满足准确率: {correct/200*100:4.1f}%")
+
+    res, path = sys.navigate(test_img[0])
+    print(f"\n示例路径 (检测震荡后): {' -> '.join(path)}")
